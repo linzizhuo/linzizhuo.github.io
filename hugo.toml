@@ -1,0 +1,51 @@
+baseURL = 'https://linzizhuo.github.io/'
+defaultContentLanguage = 'zh-cn'
+title = '从竞赛到系统 — 底层学习笔记'
+theme = 'PaperMod'
+
+# ── KaTeX 数学公式 ──────────────────────────────
+[params]
+  math = true
+  ShowReadingTime = true
+  ShowPostNavLinks = true
+  ShowBreadcrumbs = true
+  ShowCodeCopyButtons = true
+
+  # 导航菜单
+  [[menu.main]]
+    identifier = 'posts'
+    name = '文章'
+    url = '/posts/'
+    weight = 10
+
+  [[menu.main]]
+    identifier = 'tags'
+    name = '标签'
+    url = '/tags/'
+    weight = 20
+
+  [[menu.main]]
+    identifier = 'about'
+    name = '关于'
+    url = '/about/'
+    weight = 30
+
+  # 社交链接（可选）
+  [[params.social]]
+    name = 'GitHub'
+    url = 'https://github.com/linzizhuo'
+
+# ── 代码高亮 ───────────────────────────────────
+[markup.highlight]
+  noClasses = false           # 使用 CSS 类（PaperMod 自带高亮样式）
+  lineNos = true              # 显示行号
+  tabWidth = 4
+
+# ── 允许混用 HTML ──────────────────────────────
+[markup.goldmark.renderer]
+  unsafe = true
+
+# ── 默认语言 ───────────────────────────────────
+[languages.zh-cn]
+  languageName = '中文'
+  weight = 1
