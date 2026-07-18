@@ -188,4 +188,59 @@ epoll fd 内部结构：
 
 ---
 
+## 7. 单线程 Reactor 模型
+
+把前面讲的串起来——epoll（事件分离） + 非阻塞 IO + 单线程执行，就是标准的 **Reactor 模式**：
+
+```
+init_server()
+register_events(listen_fd)
+
+while (1)
+    n = epoll_wait(events)         // 同时等所有 fd（accept + 已连接 socket）
+    for (0..n)
+        if (is_listen_fd)          // 新连接
+            cfd = accept()
+            epoll_ctl(ADD, cfd)    // 注册进红黑树
+        else                       // 已有连接
+            handle_read()          // 读 → 解析 RESP → 执行 → 写回
+```
+
+**Reactor 三个角色：**
+
+| 角色 | 对应实现 |
+|------|---------|
+| 事件分离器 (Demultiplexer) | epoll — 同时监听所有 fd，谁就绪通知谁 |
+| 事件分发器 (Dispatcher) | 事件循环 `while(1) { epoll_wait → for each }` |
+| 事件处理器 (Handler) | `handle_read()` — 解析 RESP、路由命令、执行、写回 |
+
+**为什么单线程就够了？**
+
+Redis 的瓶颈不在 CPU（纯内存操作，微秒级），而在网络和内存带宽。单线程避免了锁开销、上下文切换，一条命令从头到尾不被打断——代码简单，bug 少。
+
+> 这里的"单线程"指命令执行线程。Redis 6.0+ 引入了 IO 线程（只处理网络读写），但命令执行仍然是单线程的。
+
+---
+
+## 8. 总结
+
+从 TCP 字节流怎么切出消息，到 epoll 怎么同时盯上万个连接，整个设计链条是逐层递进的：
+
+```
+TCP 字节流（粘包/拆包）
+    │  问题：消息边界在哪？
+    ▼
+RESP 格式（分隔符 + 前置长度，二进制安全）
+    │  问题：怎么高效同时等上万个连接？
+    ▼
+IO 多路复用 — epoll（O(1) 取就绪事件，观察者模式）
+    │  问题：怎么把这些组织成一个高效的调度模型？
+    ▼
+单线程 Reactor（事件分离 + 分发 + 处理，一帧到底）
+```
+
+每一层解决上一层的问题，缺一环都撑不起 Redis 的单机十万 QPS。
+
+---
+
 *最后更新：2026-07-18*
