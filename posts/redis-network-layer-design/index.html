@@ -1,0 +1,146 @@
+<!doctype html><html lang=zh-cn dir=auto data-theme=auto><head><meta charset=utf-8><meta http-equiv=X-UA-Compatible content="IE=edge"><meta name=viewport content="width=device-width,initial-scale=1,shrink-to-fit=no"><meta name=robots content="index, follow"><title>Redis网络层设计解析 | 从竞赛到系统 — 底层学习笔记</title><meta name=keywords content="Redis,源码解析,网络,TCP,epoll,RESP"><meta name=description content='
+解析 Redis 网络层的设计思路，辩证地看待每个选择的优劣。
+
+1. 为什么 Redis 选择 TCP？
+TCP 的适用场景：长连接、大数据量、数据可靠性要求高。Redis 完全符合这三个场景。
+
+  
+      
+          场景
+          Redis 的匹配
+      
+  
+  
+      
+          长连接
+          客户端与服务端保持持久连接，避免频繁握手
+      
+      
+          大数据量
+          批量操作、Pipeline、主从同步都可能传输大量数据
+      
+      
+          可靠性
+          数据不能丢，写命令必须可靠到达
+      
+  
+
+TCP 的缺点：数据实时性差、短连接不友好——这也是 HTTP/3 舍弃 TCP 改用 QUIC 的原因。
+
+2. 为什么说应用层视角下 TCP 是"异步"的？
+这是一个反常识的点。
+TCP 在传输层是同步的——确认帧、重传机制、滑动窗口、拥塞控制，教材里明摆着写着 TCP 是同步可靠的。
+那为什么应用层视角下它是"异步"的？
+答案在于系统调用语义。
+应用层
+  │  send()  ──→  数据拷进内核发送缓冲区  ──→  返回（不管发没发出去）
+  │  recv()  ──→  从内核接收缓冲区取数据  ──→  返回（不管到没到齐）
+  │
+  ▼
+内核层
+  └── TCP 栈：什么时候发、分几个包、重不重传——全是内核说了算
+
+send() 只承诺"数据拷进内核发送缓冲区了"，不承诺"数据发出去了"。什么时候真正发、分几个包发、重不重传，全是内核 TCP 栈说了算——应用层完全不知情。这就是异步：你把活交给内核，它什么时候干完不告诉你。
+recv() 同理：数据什么时候到、分几次到、一次 recv 能拿多少，全不归你管。
+
+粘包与拆包
+更麻烦的是，TCP 是字节流，不保留消息边界：'><meta name=author content><link rel=canonical href=https://linzizhuo.github.io/posts/redis-network-layer-design/><link crossorigin=anonymous href=/assets/css/stylesheet.2dd73de6ae57ad85fda2cc2d10189096fc54f16df5a3a451d98cf1cd40338ec8.css integrity="sha256-Ldc95q5XrYX9oswtEBiQlvxU8W31o6RR2YzxzUAzjsg=" rel="preload stylesheet" as=style><link rel=icon href=https://linzizhuo.github.io/favicon.ico><link rel=icon type=image/png sizes=16x16 href=https://linzizhuo.github.io/favicon-16x16.png><link rel=icon type=image/png sizes=32x32 href=https://linzizhuo.github.io/favicon-32x32.png><link rel=apple-touch-icon href=https://linzizhuo.github.io/apple-touch-icon.png><link rel=mask-icon href=https://linzizhuo.github.io/safari-pinned-tab.svg><meta name=theme-color content="#2e2e33"><meta name=msapplication-TileColor content="#2e2e33"><link rel=alternate hreflang=zh-cn href=https://linzizhuo.github.io/posts/redis-network-layer-design/><noscript><style>#theme-toggle,.top-link{display:none}</style><style>@media(prefers-color-scheme:dark){:root{--theme:rgb(29, 30, 32);--entry:rgb(46, 46, 51);--primary:rgb(218, 218, 219);--secondary:rgb(155, 156, 157);--tertiary:rgb(65, 66, 68);--content:rgb(196, 196, 197);--code-block-bg:rgb(46, 46, 51);--code-bg:rgb(55, 56, 62);--border:rgb(51, 51, 51);color-scheme:dark}.list{background:var(--theme)}.toc{background:var(--entry)}}</style></noscript><script>localStorage.getItem("pref-theme")==="dark"?document.querySelector("html").dataset.theme="dark":localStorage.getItem("pref-theme")==="light"?document.querySelector("html").dataset.theme="light":window.matchMedia("(prefers-color-scheme: dark)").matches?document.querySelector("html").dataset.theme="dark":document.querySelector("html").dataset.theme="light"</script><meta property="og:url" content="https://linzizhuo.github.io/posts/redis-network-layer-design/"><meta property="og:site_name" content="从竞赛到系统 — 底层学习笔记"><meta property="og:title" content="Redis网络层设计解析"><meta property="og:description" content='解析 Redis 网络层的设计思路，辩证地看待每个选择的优劣。
+1. 为什么 Redis 选择 TCP？ TCP 的适用场景：长连接、大数据量、数据可靠性要求高。Redis 完全符合这三个场景。
+场景 Redis 的匹配 长连接 客户端与服务端保持持久连接，避免频繁握手 大数据量 批量操作、Pipeline、主从同步都可能传输大量数据 可靠性 数据不能丢，写命令必须可靠到达 TCP 的缺点：数据实时性差、短连接不友好——这也是 HTTP/3 舍弃 TCP 改用 QUIC 的原因。
+2. 为什么说应用层视角下 TCP 是"异步"的？ 这是一个反常识的点。
+TCP 在传输层是同步的——确认帧、重传机制、滑动窗口、拥塞控制，教材里明摆着写着 TCP 是同步可靠的。
+那为什么应用层视角下它是"异步"的？
+答案在于系统调用语义。
+应用层 │ send() ──→ 数据拷进内核发送缓冲区 ──→ 返回（不管发没发出去） │ recv() ──→ 从内核接收缓冲区取数据 ──→ 返回（不管到没到齐） │ ▼ 内核层 └── TCP 栈：什么时候发、分几个包、重不重传——全是内核说了算 send() 只承诺"数据拷进内核发送缓冲区了"，不承诺"数据发出去了"。什么时候真正发、分几个包发、重不重传，全是内核 TCP 栈说了算——应用层完全不知情。这就是异步：你把活交给内核，它什么时候干完不告诉你。 recv() 同理：数据什么时候到、分几次到、一次 recv 能拿多少，全不归你管。 粘包与拆包 更麻烦的是，TCP 是字节流，不保留消息边界：'><meta property="og:locale" content="zh_cn"><meta property="og:type" content="article"><meta property="article:section" content="posts"><meta property="article:published_time" content="2026-07-18T00:00:00+00:00"><meta property="article:modified_time" content="2026-07-18T00:00:00+00:00"><meta property="article:tag" content="Redis"><meta property="article:tag" content="源码解析"><meta property="article:tag" content="网络"><meta property="article:tag" content="TCP"><meta property="article:tag" content="Epoll"><meta property="article:tag" content="RESP"><meta name=twitter:card content="summary"><meta name=twitter:title content="Redis网络层设计解析"><meta name=twitter:description content='解析 Redis 网络层的设计思路，辩证地看待每个选择的优劣。
+1. 为什么 Redis 选择 TCP？ TCP 的适用场景：长连接、大数据量、数据可靠性要求高。Redis 完全符合这三个场景。
+场景 Redis 的匹配 长连接 客户端与服务端保持持久连接，避免频繁握手 大数据量 批量操作、Pipeline、主从同步都可能传输大量数据 可靠性 数据不能丢，写命令必须可靠到达 TCP 的缺点：数据实时性差、短连接不友好——这也是 HTTP/3 舍弃 TCP 改用 QUIC 的原因。
+2. 为什么说应用层视角下 TCP 是"异步"的？ 这是一个反常识的点。
+TCP 在传输层是同步的——确认帧、重传机制、滑动窗口、拥塞控制，教材里明摆着写着 TCP 是同步可靠的。
+那为什么应用层视角下它是"异步"的？
+答案在于系统调用语义。
+应用层 │ send() ──→ 数据拷进内核发送缓冲区 ──→ 返回（不管发没发出去） │ recv() ──→ 从内核接收缓冲区取数据 ──→ 返回（不管到没到齐） │ ▼ 内核层 └── TCP 栈：什么时候发、分几个包、重不重传——全是内核说了算 send() 只承诺"数据拷进内核发送缓冲区了"，不承诺"数据发出去了"。什么时候真正发、分几个包发、重不重传，全是内核 TCP 栈说了算——应用层完全不知情。这就是异步：你把活交给内核，它什么时候干完不告诉你。 recv() 同理：数据什么时候到、分几次到、一次 recv 能拿多少，全不归你管。 粘包与拆包 更麻烦的是，TCP 是字节流，不保留消息边界：'><script type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Posts","item":"https://linzizhuo.github.io/posts/"},{"@type":"ListItem","position":2,"name":"Redis网络层设计解析","item":"https://linzizhuo.github.io/posts/redis-network-layer-design/"}]}</script><script type=application/ld+json>{"@context":"https://schema.org","@type":"BlogPosting","headline":"Redis网络层设计解析","name":"Redis网络层设计解析","description":" 解析 Redis 网络层的设计思路，辩证地看待每个选择的优劣。\n1. 为什么 Redis 选择 TCP？ TCP 的适用场景：长连接、大数据量、数据可靠性要求高。Redis 完全符合这三个场景。\n场景 Redis 的匹配 长连接 客户端与服务端保持持久连接，避免频繁握手 大数据量 批量操作、Pipeline、主从同步都可能传输大量数据 可靠性 数据不能丢，写命令必须可靠到达 TCP 的缺点：数据实时性差、短连接不友好——这也是 HTTP/3 舍弃 TCP 改用 QUIC 的原因。\n2. 为什么说应用层视角下 TCP 是\u0026quot;异步\u0026quot;的？ 这是一个反常识的点。\nTCP 在传输层是同步的——确认帧、重传机制、滑动窗口、拥塞控制，教材里明摆着写着 TCP 是同步可靠的。\n那为什么应用层视角下它是\u0026quot;异步\u0026quot;的？\n答案在于系统调用语义。\n应用层 │ send() ──→ 数据拷进内核发送缓冲区 ──→ 返回（不管发没发出去） │ recv() ──→ 从内核接收缓冲区取数据 ──→ 返回（不管到没到齐） │ ▼ 内核层 └── TCP 栈：什么时候发、分几个包、重不重传——全是内核说了算 send() 只承诺\u0026quot;数据拷进内核发送缓冲区了\u0026quot;，不承诺\u0026quot;数据发出去了\u0026quot;。什么时候真正发、分几个包发、重不重传，全是内核 TCP 栈说了算——应用层完全不知情。这就是异步：你把活交给内核，它什么时候干完不告诉你。 recv() 同理：数据什么时候到、分几次到、一次 recv 能拿多少，全不归你管。 粘包与拆包 更麻烦的是，TCP 是字节流，不保留消息边界：\n","keywords":["Redis","源码解析","网络","TCP","epoll","RESP"],"articleBody":" 解析 Redis 网络层的设计思路，辩证地看待每个选择的优劣。\n1. 为什么 Redis 选择 TCP？ TCP 的适用场景：长连接、大数据量、数据可靠性要求高。Redis 完全符合这三个场景。\n场景 Redis 的匹配 长连接 客户端与服务端保持持久连接，避免频繁握手 大数据量 批量操作、Pipeline、主从同步都可能传输大量数据 可靠性 数据不能丢，写命令必须可靠到达 TCP 的缺点：数据实时性差、短连接不友好——这也是 HTTP/3 舍弃 TCP 改用 QUIC 的原因。\n2. 为什么说应用层视角下 TCP 是\"异步\"的？ 这是一个反常识的点。\nTCP 在传输层是同步的——确认帧、重传机制、滑动窗口、拥塞控制，教材里明摆着写着 TCP 是同步可靠的。\n那为什么应用层视角下它是\"异步\"的？\n答案在于系统调用语义。\n应用层 │ send() ──→ 数据拷进内核发送缓冲区 ──→ 返回（不管发没发出去） │ recv() ──→ 从内核接收缓冲区取数据 ──→ 返回（不管到没到齐） │ ▼ 内核层 └── TCP 栈：什么时候发、分几个包、重不重传——全是内核说了算 send() 只承诺\"数据拷进内核发送缓冲区了\"，不承诺\"数据发出去了\"。什么时候真正发、分几个包发、重不重传，全是内核 TCP 栈说了算——应用层完全不知情。这就是异步：你把活交给内核，它什么时候干完不告诉你。 recv() 同理：数据什么时候到、分几次到、一次 recv 能拿多少，全不归你管。 粘包与拆包 更麻烦的是，TCP 是字节流，不保留消息边界：\n发送端： write(\"hello\") × 3 接收端可能拿到： ┌─────────────────────┐ │ \"hellohellohello\" │ ← 粘包（三次合并成一次） │ \"hel\" + \"lohello...\" │ ← 拆包（一次拆成多次） └─────────────────────┘ 你需要一个应用协议来界定消息边界。\n3. 应用层消息界定格式 方式 原理 优点 缺点 分隔符界定 特殊字节标记消息结尾（如 \\r\\n） 简单，可读性好 不适用于二进制（数据中可能出现分隔符） 前置长度 固定字节 header 声明消息体长度 简单，适合二进制 需要提前知道长度 固定长度 所有消息字节数完全相同 实现最简单 浪费空间，灵活性差 4. RESP 格式 Redis 选择了混合策略：首字符界定类型 + 分隔符 + 前置长度按需组合。\n首字节 类型 格式 示例 + Simple String +\u003c文本\u003e\\r\\n +OK\\r\\n - Error -\u003c错误信息\u003e\\r\\n -ERR unknown command\\r\\n : Integer :\u003c数字\u003e\\r\\n :1000\\r\\n $ Bulk String $\u003c长度\u003e\\r\\n\u003c数据\u003e\\r\\n $5\\r\\nhello\\r\\n * Array *\u003c元素数\u003e\\r\\n\u003c元素\u003e... *2\\r\\n$3\\r\\nfoo\\r\\n$3\\r\\nbar\\r\\n 设计思路：\n首字符用来快速区分类型，一个字节完成分派 短文本场景（Simple String、Error、Integer）：\\r\\n 分隔符足够简洁，一次界定边界的消耗几乎忽略不计，也不会有二进制问题 二进制/长串场景（Bulk String）：使用前置长度，简单可靠，适合任意二进制数据 这就是 RESP 的精妙之处——不是死板地选一种，而是按类型选用最合适的策略。\n5. 为什么 epoll 适合高并发？和 select/poll 的区别是什么？ 先看 select/poll 有什么缺陷 1 2 3 4 5 6 7 8 9 10 11 12 13 14 while (1) { FD_ZERO(\u0026rfds); FD_SET(fd1, \u0026rfds); // 每次循环都要重新注册所有 fd FD_SET(fd2, \u0026rfds); // ... select(maxfd + 1, \u0026rfds, NULL, NULL, NULL); for (int i = 0; i \u003c= maxfd; i++) { // 遍历所有 fd if (FD_ISSET(i, \u0026rfds)) { // 处理 } } } 两个致命问题：\n每次都要重新传递 fd 集合 — 内核与应用层之间大量数据拷贝 O(n) 遍历 — select 返回后必须遍历所有 fd 才能找到就绪的那几个，大部分遍历是无效的 epoll 如何解决：事件驱动 epoll 不会让你去主动遍历寻找，而是直接告诉你哪些 fd 触发了事件。\nepoll fd 内部结构： ┌── 红黑树 (rbtree) ───── 存储所有注册的 fd，key = fd │ （用于 epoll_ctl 的增删改查） │ └── 就绪链表 (rdllist) ─── 存储就绪的 fd （epoll_wait 直接从这里取，O(1)） 工作流程：\n网卡中断 → 内核将数据放入缓冲区 → 调用 ep_poll_callback() 回调 → 将 fd 丢进 rdllist（就绪链表） → epoll_wait 返回，直接取 rdllist 中的 fd select poll epoll 数据结构 位图 (fd_set) 链表 红黑树 + 就绪链表 fd 上限 1024（可改但重编译） 无限制 无限制 每次注册 fd 是（重新传整个集合） 是 否（增量增删，epoll_ctl） 获取就绪 fd O(n) 遍历 O(n) 遍历 O(1) 直接从就绪链表取 内核-用户态拷贝 大量 大量 只拷贝就绪的 设计思想 轮询 轮询 事件驱动（观察者模式） epoll 的设计思想和设计模式中的观察者模式本质相同——“别问我，我通知你”。\n6. 水平触发 vs 边沿触发：Redis 为什么选择水平触发（LT）？ 水平触发 (LT) 边沿触发 (ET) 触发条件 缓冲区有数据就通知 缓冲区状态变化时才通知一次 半包处理 数据没读完下次继续通知 数据没读完不会再通知，直到新数据到达 实现复杂度 简单 需要循环读直到 EAGAIN 快速理解水平触发和边沿触发：\nRedis 选 LT 的原因 边沿触发遇到半包会导致数据饥饿：如果一次没读完，fd 不再被触发，剩余数据就\"卡\"在里面了——直到新数据到来才会被重新触发。\n对于 Redis 这种单线程模型来说，任何阻塞或饥饿都是致命的。Redis 在其他地方的设计也能看出它在主动规避阻塞：\n场景 规避策略 网络 I/O 事件驱动 + 水平触发 持久化 fork() + COW 写时复制（子进程干活，主进程不阻塞） 数据读写 单线程，避免锁争夺开销 日志写入 重定向符异步写入 惰性删除 随机抽样，在主循环中顺手做，不交给中断 水平触发的好处：实现简单 + 避免半包阻塞。在 Redis 单线程模型下，LT 的额外唤醒开销远小于 ET 饥饿带来的风险。\n7. 单线程 Reactor 模型 把前面讲的串起来——epoll（事件分离） + 非阻塞 IO + 单线程执行，就是标准的 Reactor 模式：\ninit_server() register_events(listen_fd) while (1) n = epoll_wait(events) // 同时等所有 fd（accept + 已连接 socket） for (0..n) if (is_listen_fd) // 新连接 cfd = accept() epoll_ctl(ADD, cfd) // 注册进红黑树 else // 已有连接 handle_read() // 读 → 解析 RESP → 执行 → 写回 Reactor 三个角色：\n角色 对应实现 事件分离器 (Demultiplexer) epoll — 同时监听所有 fd，谁就绪通知谁 事件分发器 (Dispatcher) 事件循环 while(1) { epoll_wait → for each } 事件处理器 (Handler) handle_read() — 解析 RESP、路由命令、执行、写回 为什么单线程就够了？\nRedis 的瓶颈不在 CPU（纯内存操作，微秒级），而在网络和内存带宽。单线程避免了锁开销、上下文切换，一条命令从头到尾不被打断——代码简单，bug 少。\n这里的\"单线程\"指命令执行线程。Redis 6.0+ 引入了 IO 线程（只处理网络读写），但命令执行仍然是单线程的。\n8. 总结 从 TCP 字节流怎么切出消息，到 epoll 怎么同时盯上万个连接，整个设计链条是逐层递进的：\nTCP 字节流（粘包/拆包） │ 问题：消息边界在哪？ ▼ RESP 格式（分隔符 + 前置长度，二进制安全） │ 问题：怎么高效同时等上万个连接？ ▼ IO 多路复用 — epoll（O(1) 取就绪事件，观察者模式） │ 问题：怎么把这些组织成一个高效的调度模型？ ▼ 单线程 Reactor（事件分离 + 分发 + 处理，一帧到底） 每一层解决上一层的问题，缺一环都撑不起 Redis 的单机十万 QPS。\n最后更新：2026-07-18\n","wordCount":"503","inLanguage":"zh-cn","datePublished":"2026-07-18T00:00:00Z","dateModified":"2026-07-18T00:00:00Z","mainEntityOfPage":{"@type":"WebPage","@id":"https://linzizhuo.github.io/posts/redis-network-layer-design/"},"publisher":{"@type":"Organization","name":"从竞赛到系统 — 底层学习笔记","logo":{"@type":"ImageObject","url":"https://linzizhuo.github.io/favicon.ico"}}}</script></head><body id=top><header class=header><nav class=header-nav><div class=logo><a href=https://linzizhuo.github.io/ accesskey=h title="从竞赛到系统 — 底层学习笔记 (Alt + H)">从竞赛到系统 — 底层学习笔记</a><div class=logo-switches><button id=theme-toggle class=theme-toggle accesskey=t title="(Alt + T)" aria-label="Toggle theme">
+<svg class="moon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+<svg class="sun" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg></button></div></div><ul id=menu class=menu><li><a href=https://linzizhuo.github.io/posts/ title=文章><span>文章</span></a></li><li><a href=https://linzizhuo.github.io/tags/ title=标签><span>标签</span></a></li><li><a href=https://linzizhuo.github.io/about/ title=关于><span>关于</span></a></li></ul></nav></header><main class=main><article class=post-single><header class=post-header><nav class=breadcrumbs role=navigation aria-label=Breadcrumb><a href=/>Home</a>
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-chevron-right"><polyline points="9 18 15 12 9 6"/></svg>
+<a href=/posts/>Posts</a>
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-chevron-right"><polyline points="9 18 15 12 9 6"/></svg></nav><h1 class="post-title entry-hint-parent">Redis网络层设计解析</h1><div class=post-meta><span title='2026-07-18 00:00:00 +0000 UTC'>July 18, 2026</span>&nbsp;·&nbsp;<span>3 min</span></div></header><div class="post-content md-content"><blockquote><p>解析 Redis 网络层的设计思路，辩证地看待每个选择的优劣。</p></blockquote><hr><h2 id=1-为什么-redis-选择-tcp>1. 为什么 Redis 选择 TCP？<a hidden class=anchor aria-hidden=true href=#1-为什么-redis-选择-tcp>#</a></h2><p>TCP 的适用场景：<strong>长连接、大数据量、数据可靠性要求高</strong>。Redis 完全符合这三个场景。</p><table><thead><tr><th>场景</th><th>Redis 的匹配</th></tr></thead><tbody><tr><td>长连接</td><td>客户端与服务端保持持久连接，避免频繁握手</td></tr><tr><td>大数据量</td><td>批量操作、Pipeline、主从同步都可能传输大量数据</td></tr><tr><td>可靠性</td><td>数据不能丢，写命令必须可靠到达</td></tr></tbody></table><p>TCP 的缺点：数据实时性差、短连接不友好——这也是 HTTP/3 舍弃 TCP 改用 QUIC 的原因。</p><hr><h2 id=2-为什么说应用层视角下-tcp-是异步的>2. 为什么说应用层视角下 TCP 是"异步"的？<a hidden class=anchor aria-hidden=true href=#2-为什么说应用层视角下-tcp-是异步的>#</a></h2><p>这是一个<strong>反常识</strong>的点。</p><p>TCP 在<strong>传输层</strong>是同步的——确认帧、重传机制、滑动窗口、拥塞控制，教材里明摆着写着 TCP 是同步可靠的。</p><p>那为什么<strong>应用层视角</strong>下它是"异步"的？</p><p><strong>答案在于系统调用语义。</strong></p><pre tabindex=0><code>应用层
+  │  send()  ──→  数据拷进内核发送缓冲区  ──→  返回（不管发没发出去）
+  │  recv()  ──→  从内核接收缓冲区取数据  ──→  返回（不管到没到齐）
+  │
+  ▼
+内核层
+  └── TCP 栈：什么时候发、分几个包、重不重传——全是内核说了算
+</code></pre><ul><li><strong>send()</strong> 只承诺"数据拷进内核发送缓冲区了"，不承诺"数据发出去了"。什么时候真正发、分几个包发、重不重传，全是内核 TCP 栈说了算——应用层完全不知情。这就是异步：你把活交给内核，它什么时候干完不告诉你。</li><li><strong>recv()</strong> 同理：数据什么时候到、分几次到、一次 recv 能拿多少，全不归你管。</li></ul><h3 id=粘包与拆包>粘包与拆包<a hidden class=anchor aria-hidden=true href=#粘包与拆包>#</a></h3><p>更麻烦的是，TCP 是<strong>字节流</strong>，不保留消息边界：</p><pre tabindex=0><code>发送端： write(&#34;hello&#34;)  × 3
+
+接收端可能拿到：
+  ┌─────────────────────┐
+  │ &#34;hellohellohello&#34;    │  ← 粘包（三次合并成一次）
+  │ &#34;hel&#34; + &#34;lohello...&#34; │  ← 拆包（一次拆成多次）
+  └─────────────────────┘
+</code></pre><p><strong>你需要一个应用协议来界定消息边界。</strong></p><hr><h2 id=3-应用层消息界定格式>3. 应用层消息界定格式<a hidden class=anchor aria-hidden=true href=#3-应用层消息界定格式>#</a></h2><table><thead><tr><th>方式</th><th>原理</th><th>优点</th><th>缺点</th></tr></thead><tbody><tr><td><strong>分隔符界定</strong></td><td>特殊字节标记消息结尾（如 <code>\r\n</code>）</td><td>简单，可读性好</td><td>不适用于二进制（数据中可能出现分隔符）</td></tr><tr><td><strong>前置长度</strong></td><td>固定字节 header 声明消息体长度</td><td>简单，适合二进制</td><td>需要提前知道长度</td></tr><tr><td><strong>固定长度</strong></td><td>所有消息字节数完全相同</td><td>实现最简单</td><td>浪费空间，灵活性差</td></tr></tbody></table><hr><h2 id=4-resp-格式>4. RESP 格式<a hidden class=anchor aria-hidden=true href=#4-resp-格式>#</a></h2><p>Redis 选择了<strong>混合策略</strong>：首字符界定类型 + 分隔符 + 前置长度按需组合。</p><table><thead><tr><th>首字节</th><th>类型</th><th>格式</th><th>示例</th></tr></thead><tbody><tr><td><code>+</code></td><td>Simple String</td><td><code>+&lt;文本>\r\n</code></td><td><code>+OK\r\n</code></td></tr><tr><td><code>-</code></td><td>Error</td><td><code>-&lt;错误信息>\r\n</code></td><td><code>-ERR unknown command\r\n</code></td></tr><tr><td><code>:</code></td><td>Integer</td><td><code>:&lt;数字>\r\n</code></td><td><code>:1000\r\n</code></td></tr><tr><td><code>$</code></td><td>Bulk String</td><td><code>$&lt;长度>\r\n&lt;数据>\r\n</code></td><td><code>$5\r\nhello\r\n</code></td></tr><tr><td><code>*</code></td><td>Array</td><td><code>*&lt;元素数>\r\n&lt;元素>...</code></td><td><code>*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n</code></td></tr></tbody></table><p><strong>设计思路：</strong></p><ul><li><strong>首字符</strong>用来快速区分类型，一个字节完成分派</li><li><strong>短文本场景</strong>（Simple String、Error、Integer）：<code>\r\n</code> 分隔符足够简洁，一次界定边界的消耗几乎忽略不计，也不会有二进制问题</li><li><strong>二进制/长串场景</strong>（Bulk String）：使用<strong>前置长度</strong>，简单可靠，适合任意二进制数据</li></ul><p>这就是 RESP 的精妙之处——不是死板地选一种，而是<strong>按类型选用最合适的策略</strong>。</p><hr><h2 id=5-为什么-epoll-适合高并发和-selectpoll-的区别是什么>5. 为什么 epoll 适合高并发？和 select/poll 的区别是什么？<a hidden class=anchor aria-hidden=true href=#5-为什么-epoll-适合高并发和-selectpoll-的区别是什么>#</a></h2><h3 id=先看-selectpoll-有什么缺陷>先看 select/poll 有什么缺陷<a hidden class=anchor aria-hidden=true href=#先看-selectpoll-有什么缺陷>#</a></h3><div class=highlight><div class=chroma><table class=lntable><tr><td class=lntd><pre tabindex=0 class=chroma><code><span class=lnt> 1
+</span><span class=lnt> 2
+</span><span class=lnt> 3
+</span><span class=lnt> 4
+</span><span class=lnt> 5
+</span><span class=lnt> 6
+</span><span class=lnt> 7
+</span><span class=lnt> 8
+</span><span class=lnt> 9
+</span><span class=lnt>10
+</span><span class=lnt>11
+</span><span class=lnt>12
+</span><span class=lnt>13
+</span><span class=lnt>14
+</span></code></pre></td><td class=lntd><pre tabindex=0 class=chroma><code class=language-c data-lang=c><span class=line><span class=cl><span class=k>while</span> <span class=p>(</span><span class=mi>1</span><span class=p>)</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>    <span class=nf>FD_ZERO</span><span class=p>(</span><span class=o>&amp;</span><span class=n>rfds</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=nf>FD_SET</span><span class=p>(</span><span class=n>fd1</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rfds</span><span class=p>);</span>   <span class=c1>// 每次循环都要重新注册所有 fd
+</span></span></span><span class=line><span class=cl><span class=c1></span>    <span class=nf>FD_SET</span><span class=p>(</span><span class=n>fd2</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rfds</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>    <span class=c1>// ...
+</span></span></span><span class=line><span class=cl><span class=c1></span>
+</span></span><span class=line><span class=cl>    <span class=nf>select</span><span class=p>(</span><span class=n>maxfd</span> <span class=o>+</span> <span class=mi>1</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rfds</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>,</span> <span class=nb>NULL</span><span class=p>);</span>
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>    <span class=k>for</span> <span class=p>(</span><span class=kt>int</span> <span class=n>i</span> <span class=o>=</span> <span class=mi>0</span><span class=p>;</span> <span class=n>i</span> <span class=o>&lt;=</span> <span class=n>maxfd</span><span class=p>;</span> <span class=n>i</span><span class=o>++</span><span class=p>)</span> <span class=p>{</span>   <span class=c1>// 遍历所有 fd
+</span></span></span><span class=line><span class=cl><span class=c1></span>        <span class=k>if</span> <span class=p>(</span><span class=nf>FD_ISSET</span><span class=p>(</span><span class=n>i</span><span class=p>,</span> <span class=o>&amp;</span><span class=n>rfds</span><span class=p>))</span> <span class=p>{</span>
+</span></span><span class=line><span class=cl>            <span class=c1>// 处理
+</span></span></span><span class=line><span class=cl><span class=c1></span>        <span class=p>}</span>
+</span></span><span class=line><span class=cl>    <span class=p>}</span>
+</span></span><span class=line><span class=cl><span class=p>}</span>
+</span></span></code></pre></td></tr></table></div></div><p><strong>两个致命问题：</strong></p><ol><li><strong>每次都要重新传递 fd 集合</strong> — 内核与应用层之间大量数据拷贝</li><li><strong>O(n) 遍历</strong> — select 返回后必须遍历所有 fd 才能找到就绪的那几个，大部分遍历是无效的</li></ol><h3 id=epoll-如何解决事件驱动>epoll 如何解决：事件驱动<a hidden class=anchor aria-hidden=true href=#epoll-如何解决事件驱动>#</a></h3><p>epoll 不会让你去主动遍历寻找，而是<strong>直接告诉你哪些 fd 触发了事件</strong>。</p><pre tabindex=0><code>epoll fd 内部结构：
+
+  ┌── 红黑树 (rbtree) ───── 存储所有注册的 fd，key = fd
+  │                          （用于 epoll_ctl 的增删改查）
+  │
+  └── 就绪链表 (rdllist) ─── 存储就绪的 fd
+                              （epoll_wait 直接从这里取，O(1)）
+</code></pre><p><strong>工作流程：</strong></p><pre tabindex=0><code>网卡中断 → 内核将数据放入缓冲区
+         → 调用 ep_poll_callback() 回调
+         → 将 fd 丢进 rdllist（就绪链表）
+         → epoll_wait 返回，直接取 rdllist 中的 fd
+</code></pre><table><thead><tr><th></th><th>select</th><th>poll</th><th>epoll</th></tr></thead><tbody><tr><td>数据结构</td><td>位图 (fd_set)</td><td>链表</td><td>红黑树 + 就绪链表</td></tr><tr><td>fd 上限</td><td>1024（可改但重编译）</td><td>无限制</td><td>无限制</td></tr><tr><td>每次注册 fd</td><td>是（重新传整个集合）</td><td>是</td><td>否（增量增删，epoll_ctl）</td></tr><tr><td>获取就绪 fd</td><td>O(n) 遍历</td><td>O(n) 遍历</td><td>O(1) 直接从就绪链表取</td></tr><tr><td>内核-用户态拷贝</td><td>大量</td><td>大量</td><td>只拷贝就绪的</td></tr><tr><td>设计思想</td><td>轮询</td><td>轮询</td><td><strong>事件驱动（观察者模式）</strong></td></tr></tbody></table><blockquote><p>epoll 的设计思想和设计模式中的<strong>观察者模式</strong>本质相同——&ldquo;别问我，我通知你&rdquo;。</p></blockquote><hr><h2 id=6-水平触发-vs-边沿触发redis-为什么选择水平触发lt>6. 水平触发 vs 边沿触发：Redis 为什么选择水平触发（LT）？<a hidden class=anchor aria-hidden=true href=#6-水平触发-vs-边沿触发redis-为什么选择水平触发lt>#</a></h2><table><thead><tr><th></th><th>水平触发 (LT)</th><th>边沿触发 (ET)</th></tr></thead><tbody><tr><td>触发条件</td><td>缓冲区有数据就通知</td><td>缓冲区状态变化时才通知一次</td></tr><tr><td>半包处理</td><td>数据没读完下次继续通知</td><td>数据没读完<strong>不会再通知</strong>，直到新数据到达</td></tr><tr><td>实现复杂度</td><td>简单</td><td>需要循环读直到 EAGAIN</td></tr></tbody></table><p>快速理解水平触发和边沿触发：</p><p><img alt="alt text" loading=lazy src=/images/epoll-lt-et.png></p><h3 id=redis-选-lt-的原因>Redis 选 LT 的原因<a hidden class=anchor aria-hidden=true href=#redis-选-lt-的原因>#</a></h3><p><strong>边沿触发遇到半包会导致数据饥饿</strong>：如果一次没读完，fd 不再被触发，剩余数据就"卡"在里面了——直到新数据到来才会被重新触发。</p><p>对于 Redis 这种<strong>单线程模型</strong>来说，任何阻塞或饥饿都是致命的。Redis 在其他地方的设计也能看出它在主动规避阻塞：</p><table><thead><tr><th>场景</th><th>规避策略</th></tr></thead><tbody><tr><td>网络 I/O</td><td>事件驱动 + 水平触发</td></tr><tr><td>持久化</td><td><code>fork()</code> + COW 写时复制（子进程干活，主进程不阻塞）</td></tr><tr><td>数据读写</td><td>单线程，避免锁争夺开销</td></tr><tr><td>日志写入</td><td>重定向符异步写入</td></tr><tr><td>惰性删除</td><td>随机抽样，在主循环中顺手做，不交给中断</td></tr></tbody></table><blockquote><p>水平触发的好处：<strong>实现简单 + 避免半包阻塞</strong>。在 Redis 单线程模型下，LT 的额外唤醒开销远小于 ET 饥饿带来的风险。</p></blockquote><hr><h2 id=7-单线程-reactor-模型>7. 单线程 Reactor 模型<a hidden class=anchor aria-hidden=true href=#7-单线程-reactor-模型>#</a></h2><p>把前面讲的串起来——epoll（事件分离） + 非阻塞 IO + 单线程执行，就是标准的 <strong>Reactor 模式</strong>：</p><pre tabindex=0><code>init_server()
+register_events(listen_fd)
+
+while (1)
+    n = epoll_wait(events)         // 同时等所有 fd（accept + 已连接 socket）
+    for (0..n)
+        if (is_listen_fd)          // 新连接
+            cfd = accept()
+            epoll_ctl(ADD, cfd)    // 注册进红黑树
+        else                       // 已有连接
+            handle_read()          // 读 → 解析 RESP → 执行 → 写回
+</code></pre><p><strong>Reactor 三个角色：</strong></p><table><thead><tr><th>角色</th><th>对应实现</th></tr></thead><tbody><tr><td>事件分离器 (Demultiplexer)</td><td>epoll — 同时监听所有 fd，谁就绪通知谁</td></tr><tr><td>事件分发器 (Dispatcher)</td><td>事件循环 <code>while(1) { epoll_wait → for each }</code></td></tr><tr><td>事件处理器 (Handler)</td><td><code>handle_read()</code> — 解析 RESP、路由命令、执行、写回</td></tr></tbody></table><p><strong>为什么单线程就够了？</strong></p><p>Redis 的瓶颈不在 CPU（纯内存操作，微秒级），而在网络和内存带宽。单线程避免了锁开销、上下文切换，一条命令从头到尾不被打断——代码简单，bug 少。</p><blockquote><p>这里的"单线程"指命令执行线程。Redis 6.0+ 引入了 IO 线程（只处理网络读写），但命令执行仍然是单线程的。</p></blockquote><hr><h2 id=8-总结>8. 总结<a hidden class=anchor aria-hidden=true href=#8-总结>#</a></h2><p>从 TCP 字节流怎么切出消息，到 epoll 怎么同时盯上万个连接，整个设计链条是逐层递进的：</p><pre tabindex=0><code>TCP 字节流（粘包/拆包）
+    │  问题：消息边界在哪？
+    ▼
+RESP 格式（分隔符 + 前置长度，二进制安全）
+    │  问题：怎么高效同时等上万个连接？
+    ▼
+IO 多路复用 — epoll（O(1) 取就绪事件，观察者模式）
+    │  问题：怎么把这些组织成一个高效的调度模型？
+    ▼
+单线程 Reactor（事件分离 + 分发 + 处理，一帧到底）
+</code></pre><p>每一层解决上一层的问题，缺一环都撑不起 Redis 的单机十万 QPS。</p><hr><p><em>最后更新：2026-07-18</em></p></div><footer class=post-footer><ul class=post-tags><li><a href=https://linzizhuo.github.io/tags/redis/>Redis</a></li><li><a href=https://linzizhuo.github.io/tags/%E6%BA%90%E7%A0%81%E8%A7%A3%E6%9E%90/>源码解析</a></li><li><a href=https://linzizhuo.github.io/tags/%E7%BD%91%E7%BB%9C/>网络</a></li><li><a href=https://linzizhuo.github.io/tags/tcp/>TCP</a></li><li><a href=https://linzizhuo.github.io/tags/epoll/>Epoll</a></li><li><a href=https://linzizhuo.github.io/tags/resp/>RESP</a></li></ul><nav class=paginav><a class=prev href=https://linzizhuo.github.io/posts/redis-expire-deletion-mechanism/><span class=title>« </span><span>Redis过期删除机制：从惰性删除到定期抽样</span>
+</a><a class=next href=https://linzizhuo.github.io/posts/redis-sds-design-part2/><span class=title>»</span>
+<span>Redis源码解析——一份通用的动态字符串设计方案（下）</span></a></nav></footer></article></main><footer class=footer><span>&copy; 2026 <a href=https://linzizhuo.github.io/>从竞赛到系统 — 底层学习笔记</a></span> ·
+<span>Powered by
+<a href="https://gohugo.io/?utm_source=papermod" rel=noopener target=_blank>Hugo</a> &
+<a href=https://github.com/adityatelange/hugo-PaperMod/ rel=noopener target=_blank>PaperMod</a></span></footer><a href=#top id=top-link class="top-link hidden" aria-label="go to top" title="Go to Top (Alt + G)" accesskey=g><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-chevrons-up"><polyline points="17 11 12 6 7 11"/><polyline points="17 18 12 13 7 18"/></svg>
+</a><script>let menu=document.getElementById("menu");if(menu){const e=localStorage.getItem("menu-scroll-position");e&&(menu.scrollLeft=parseInt(e,10)),menu.onscroll=function(){localStorage.setItem("menu-scroll-position",menu.scrollLeft)}}document.querySelectorAll('a[href^="#"]').forEach(e=>{e.addEventListener("click",function(e){e.preventDefault();var t=this.getAttribute("href").substr(1);window.matchMedia("(prefers-reduced-motion: reduce)").matches?document.querySelector(`[id='${decodeURIComponent(t)}']`).scrollIntoView():document.querySelector(`[id='${decodeURIComponent(t)}']`).scrollIntoView({behavior:"smooth"}),t==="top"?history.replaceState(null,null," "):history.pushState(null,null,`#${t}`)})})</script><script>var toplink=document.getElementById("top-link");window.onscroll=function(){const e=window.innerHeight;document.body.scrollTop>e||document.documentElement.scrollTop>e?toplink.classList.remove("hidden"):toplink.classList.add("hidden")}</script><script>document.getElementById("theme-toggle").addEventListener("click",()=>{const e=document.querySelector("html");e.dataset.theme==="dark"?(e.dataset.theme="light",localStorage.setItem("pref-theme","light")):(e.dataset.theme="dark",localStorage.setItem("pref-theme","dark"))})</script><script>document.querySelectorAll("pre > code").forEach(e=>{const n=e.parentNode.parentNode,t=document.createElement("button");t.classList.add("copy-code"),t.innerHTML="copy";function s(){t.innerHTML="copied!",setTimeout(()=>{t.innerHTML="copy"},2e3)}t.addEventListener("click",t=>{if("clipboard"in navigator){navigator.clipboard.writeText(e.textContent),s();return}const n=document.createRange();n.selectNodeContents(e);const o=window.getSelection();o.removeAllRanges(),o.addRange(n);try{document.execCommand("copy"),s()}catch{}o.removeRange(n)}),n.classList.contains("highlight")?n.appendChild(t):n.parentNode.firstChild==n||(e.parentNode.parentNode.parentNode.parentNode.parentNode.nodeName=="TABLE"?e.parentNode.parentNode.parentNode.parentNode.parentNode.appendChild(t):e.parentNode.appendChild(t))})</script></body></html>

@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>惰性删除 on 从竞赛到系统 — 底层学习笔记</title><link>https://linzizhuo.github.io/tags/%E6%83%B0%E6%80%A7%E5%88%A0%E9%99%A4/</link><description>Recent content in 惰性删除 on 从竞赛到系统 — 底层学习笔记</description><generator>Hugo</generator><language>zh-cn</language><lastBuildDate>Mon, 20 Jul 2026 00:00:00 +0000</lastBuildDate><atom:link href="https://linzizhuo.github.io/tags/%E6%83%B0%E6%80%A7%E5%88%A0%E9%99%A4/index.xml" rel="self" type="application/rss+xml"/><item><title>Redis过期删除机制：从惰性删除到定期抽样</title><link>https://linzizhuo.github.io/posts/redis-expire-deletion-mechanism/</link><pubDate>Mon, 20 Jul 2026 00:00:00 +0000</pubDate><guid>https://linzizhuo.github.io/posts/redis-expire-deletion-mechanism/</guid><description>&lt;blockquote&gt;
+&lt;p&gt;解析 Redis 过期 key 删除策略的层层设计——从惰性删除到定期抽样，理解&amp;quot;宁可少删，不可阻塞&amp;quot;的哲学。&lt;/p&gt;&lt;/blockquote&gt;
+&lt;hr&gt;
+&lt;h2 id="1-过期删除的三种设计思路"&gt;1. 过期删除的三种设计思路&lt;/h2&gt;
+&lt;p&gt;设计 key 过期机制，通常有三种方案：&lt;/p&gt;
+&lt;h3 id="方案一定时全量扫描"&gt;方案一：定时全量扫描&lt;/h3&gt;
+&lt;p&gt;维护一张 TTL 表，定时扫描表中哪些 key 过期了。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;问题&lt;/strong&gt;：O(n) 遍历，极其低效。百万级 key 扫一轮，CPU 全耗在上面了。&lt;/p&gt;
+&lt;h3 id="方案二系统中断驱动"&gt;方案二：系统中断驱动&lt;/h3&gt;
+&lt;p&gt;利用系统调用的定时器中断，精确在 key 过期的那一刻触发删除。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;问题&lt;/strong&gt;：看似优雅，但对 Redis 这种海量 key 的内存数据库来说，未知的中断 = 不可预知的阻塞。频繁中断也会严重影响系统吞吐，违背 Redis 单线程高性能的设计哲学。&lt;/p&gt;
+&lt;h3 id="方案三惰性删除redis-的选择"&gt;方案三：惰性删除（Redis 的选择）&lt;/h3&gt;
+&lt;p&gt;不主动清理过期 key，只在访问时顺手看一眼有没有过期。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;优点&lt;/strong&gt;：几乎没有额外 CPU 开销。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;缺点&lt;/strong&gt;：用空间换时间——已经过期但长期未被访问的 key 会一直占着内存，成为&amp;quot;内存垃圾&amp;quot;。&lt;/p&gt;
+&lt;h2 id="2-惰性删除的兜底定期抽样删除"&gt;2. 惰性删除的兜底：定期抽样删除&lt;/h2&gt;
+&lt;p&gt;惰性删除本身的缺陷是内存回收不及时，所以需要一个兜底机制来主动扫描。但这又回到了方案一的问题——全量扫描太重。&lt;/p&gt;
+&lt;p&gt;Redis 的解法是&lt;strong&gt;定期 + 抽样&lt;/strong&gt;：不扫全部，每次只随机抽一小部分，用概率换取性能。&lt;/p&gt;
+&lt;h2 id="3-slow--fast-双模式"&gt;3. SLOW / FAST 双模式&lt;/h2&gt;
+&lt;p&gt;Redis 将定期删除分为两种模式，配合当前的事件循环模型：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;true&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// epoll 处理网络事件
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;&lt;/span&gt; &lt;span class="p"&gt;...&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// beforeSleep 里触发，每个事件循环都来
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;&lt;/span&gt; &lt;span class="nf"&gt;tryFAST&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// serverCron 里触发，每秒 hz 次
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;&lt;/span&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="err"&gt;到&lt;/span&gt; &lt;span class="n"&gt;serverCron&lt;/span&gt; &lt;span class="err"&gt;的点了&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;activeExpireCycle&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;SLOW&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;&lt;/th&gt;
+&lt;th&gt;SLOW&lt;/th&gt;
+&lt;th&gt;FAST&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;触发路径&lt;/td&gt;
+&lt;td&gt;serverCron&lt;/td&gt;
+&lt;td&gt;beforeSleep（每个事件循环）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;频率&lt;/td&gt;
+&lt;td&gt;server.hz（默认 10Hz，动态）&lt;/td&gt;
+&lt;td&gt;事件循环级（高频）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;时间预算&lt;/td&gt;
+&lt;td&gt;25% CPU / hz（默认约 25ms）&lt;/td&gt;
+&lt;td&gt;1ms 固定&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;职责&lt;/td&gt;
+&lt;td&gt;主力清理&lt;/td&gt;
+&lt;td&gt;见缝插针，给 SLOW 补刀&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h3 id="fast-前置拦截"&gt;FAST 前置拦截&lt;/h3&gt;
+&lt;p&gt;FAST 不是每次都真正执行，有两个前置条件：&lt;/p&gt;</description></item></channel></rss>

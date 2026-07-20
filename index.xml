@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>从竞赛到系统 — 底层学习笔记</title><link>https://linzizhuo.github.io/</link><description>Recent content on 从竞赛到系统 — 底层学习笔记</description><generator>Hugo</generator><language>zh-cn</language><lastBuildDate>Mon, 20 Jul 2026 00:00:00 +0000</lastBuildDate><atom:link href="https://linzizhuo.github.io/index.xml" rel="self" type="application/rss+xml"/><item><title>Redis过期删除机制：从惰性删除到定期抽样</title><link>https://linzizhuo.github.io/posts/redis-expire-deletion-mechanism/</link><pubDate>Mon, 20 Jul 2026 00:00:00 +0000</pubDate><guid>https://linzizhuo.github.io/posts/redis-expire-deletion-mechanism/</guid><description>&lt;blockquote&gt;
+&lt;p&gt;解析 Redis 过期 key 删除策略的层层设计——从惰性删除到定期抽样，理解&amp;quot;宁可少删，不可阻塞&amp;quot;的哲学。&lt;/p&gt;&lt;/blockquote&gt;
+&lt;hr&gt;
+&lt;h2 id="1-过期删除的三种设计思路"&gt;1. 过期删除的三种设计思路&lt;/h2&gt;
+&lt;p&gt;设计 key 过期机制，通常有三种方案：&lt;/p&gt;
+&lt;h3 id="方案一定时全量扫描"&gt;方案一：定时全量扫描&lt;/h3&gt;
+&lt;p&gt;维护一张 TTL 表，定时扫描表中哪些 key 过期了。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;问题&lt;/strong&gt;：O(n) 遍历，极其低效。百万级 key 扫一轮，CPU 全耗在上面了。&lt;/p&gt;
+&lt;h3 id="方案二系统中断驱动"&gt;方案二：系统中断驱动&lt;/h3&gt;
+&lt;p&gt;利用系统调用的定时器中断，精确在 key 过期的那一刻触发删除。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;问题&lt;/strong&gt;：看似优雅，但对 Redis 这种海量 key 的内存数据库来说，未知的中断 = 不可预知的阻塞。频繁中断也会严重影响系统吞吐，违背 Redis 单线程高性能的设计哲学。&lt;/p&gt;
+&lt;h3 id="方案三惰性删除redis-的选择"&gt;方案三：惰性删除（Redis 的选择）&lt;/h3&gt;
+&lt;p&gt;不主动清理过期 key，只在访问时顺手看一眼有没有过期。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;优点&lt;/strong&gt;：几乎没有额外 CPU 开销。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;缺点&lt;/strong&gt;：用空间换时间——已经过期但长期未被访问的 key 会一直占着内存，成为&amp;quot;内存垃圾&amp;quot;。&lt;/p&gt;
+&lt;h2 id="2-惰性删除的兜底定期抽样删除"&gt;2. 惰性删除的兜底：定期抽样删除&lt;/h2&gt;
+&lt;p&gt;惰性删除本身的缺陷是内存回收不及时，所以需要一个兜底机制来主动扫描。但这又回到了方案一的问题——全量扫描太重。&lt;/p&gt;
+&lt;p&gt;Redis 的解法是&lt;strong&gt;定期 + 抽样&lt;/strong&gt;：不扫全部，每次只随机抽一小部分，用概率换取性能。&lt;/p&gt;
+&lt;h2 id="3-slow--fast-双模式"&gt;3. SLOW / FAST 双模式&lt;/h2&gt;
+&lt;p&gt;Redis 将定期删除分为两种模式，配合当前的事件循环模型：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;true&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// epoll 处理网络事件
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;&lt;/span&gt; &lt;span class="p"&gt;...&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// beforeSleep 里触发，每个事件循环都来
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;&lt;/span&gt; &lt;span class="nf"&gt;tryFAST&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="c1"&gt;// serverCron 里触发，每秒 hz 次
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="c1"&gt;&lt;/span&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="err"&gt;到&lt;/span&gt; &lt;span class="n"&gt;serverCron&lt;/span&gt; &lt;span class="err"&gt;的点了&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;activeExpireCycle&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;SLOW&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;&lt;/th&gt;
+&lt;th&gt;SLOW&lt;/th&gt;
+&lt;th&gt;FAST&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;触发路径&lt;/td&gt;
+&lt;td&gt;serverCron&lt;/td&gt;
+&lt;td&gt;beforeSleep（每个事件循环）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;频率&lt;/td&gt;
+&lt;td&gt;server.hz（默认 10Hz，动态）&lt;/td&gt;
+&lt;td&gt;事件循环级（高频）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;时间预算&lt;/td&gt;
+&lt;td&gt;25% CPU / hz（默认约 25ms）&lt;/td&gt;
+&lt;td&gt;1ms 固定&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;职责&lt;/td&gt;
+&lt;td&gt;主力清理&lt;/td&gt;
+&lt;td&gt;见缝插针，给 SLOW 补刀&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h3 id="fast-前置拦截"&gt;FAST 前置拦截&lt;/h3&gt;
+&lt;p&gt;FAST 不是每次都真正执行，有两个前置条件：&lt;/p&gt;</description></item><item><title>Redis网络层设计解析</title><link>https://linzizhuo.github.io/posts/redis-network-layer-design/</link><pubDate>Sat, 18 Jul 2026 00:00:00 +0000</pubDate><guid>https://linzizhuo.github.io/posts/redis-network-layer-design/</guid><description>&lt;blockquote&gt;
+&lt;p&gt;解析 Redis 网络层的设计思路，辩证地看待每个选择的优劣。&lt;/p&gt;&lt;/blockquote&gt;
+&lt;hr&gt;
+&lt;h2 id="1-为什么-redis-选择-tcp"&gt;1. 为什么 Redis 选择 TCP？&lt;/h2&gt;
+&lt;p&gt;TCP 的适用场景：&lt;strong&gt;长连接、大数据量、数据可靠性要求高&lt;/strong&gt;。Redis 完全符合这三个场景。&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;场景&lt;/th&gt;
+&lt;th&gt;Redis 的匹配&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;长连接&lt;/td&gt;
+&lt;td&gt;客户端与服务端保持持久连接，避免频繁握手&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;大数据量&lt;/td&gt;
+&lt;td&gt;批量操作、Pipeline、主从同步都可能传输大量数据&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;可靠性&lt;/td&gt;
+&lt;td&gt;数据不能丢，写命令必须可靠到达&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;TCP 的缺点：数据实时性差、短连接不友好——这也是 HTTP/3 舍弃 TCP 改用 QUIC 的原因。&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2 id="2-为什么说应用层视角下-tcp-是异步的"&gt;2. 为什么说应用层视角下 TCP 是&amp;quot;异步&amp;quot;的？&lt;/h2&gt;
+&lt;p&gt;这是一个&lt;strong&gt;反常识&lt;/strong&gt;的点。&lt;/p&gt;
+&lt;p&gt;TCP 在&lt;strong&gt;传输层&lt;/strong&gt;是同步的——确认帧、重传机制、滑动窗口、拥塞控制，教材里明摆着写着 TCP 是同步可靠的。&lt;/p&gt;
+&lt;p&gt;那为什么&lt;strong&gt;应用层视角&lt;/strong&gt;下它是&amp;quot;异步&amp;quot;的？&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;答案在于系统调用语义。&lt;/strong&gt;&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;应用层
+│ send() ──→ 数据拷进内核发送缓冲区 ──→ 返回（不管发没发出去）
+│ recv() ──→ 从内核接收缓冲区取数据 ──→ 返回（不管到没到齐）
+│
+▼
+内核层
+└── TCP 栈：什么时候发、分几个包、重不重传——全是内核说了算
+&lt;/code&gt;&lt;/pre&gt;&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;send()&lt;/strong&gt; 只承诺&amp;quot;数据拷进内核发送缓冲区了&amp;quot;，不承诺&amp;quot;数据发出去了&amp;quot;。什么时候真正发、分几个包发、重不重传，全是内核 TCP 栈说了算——应用层完全不知情。这就是异步：你把活交给内核，它什么时候干完不告诉你。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;recv()&lt;/strong&gt; 同理：数据什么时候到、分几次到、一次 recv 能拿多少，全不归你管。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3 id="粘包与拆包"&gt;粘包与拆包&lt;/h3&gt;
+&lt;p&gt;更麻烦的是，TCP 是&lt;strong&gt;字节流&lt;/strong&gt;，不保留消息边界：&lt;/p&gt;</description></item><item><title>Redis源码解析——一份通用的动态字符串设计方案（下）</title><link>https://linzizhuo.github.io/posts/redis-sds-design-part2/</link><pubDate>Thu, 16 Jul 2026 00:00:00 +0000</pubDate><guid>https://linzizhuo.github.io/posts/redis-sds-design-part2/</guid><description>&lt;p&gt;之前我们讲过了 Redis SDS 中的分类设计，今天来讲讲 &lt;code&gt;new&lt;/code&gt; 和 &lt;code&gt;expand&lt;/code&gt; 这两个部分。&lt;/p&gt;
+&lt;p&gt;两者看上去大差不差，但——&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;如果在分段头设计上 SDS 体现出了一种思想：&lt;strong&gt;按需分配，绝不多做事情&lt;/strong&gt;；&lt;/li&gt;
+&lt;li&gt;那么在 &lt;code&gt;new&lt;/code&gt;/&lt;code&gt;expand&lt;/code&gt; 上则体现出了一种：&lt;strong&gt;该保守保守，该激进激进&lt;/strong&gt;的设计哲学。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;两者本质上是相同的，都是在有限情况下对资源的最优解。&lt;/p&gt;
+&lt;p&gt;首先声明，这里不会讲 SDS 所有涉及 &lt;code&gt;new&lt;/code&gt;/&lt;code&gt;expand&lt;/code&gt; 的实现，而是主要围绕两个核心函数展开：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;_sdsnewlen&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;_sdsMakeRoomFor&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;blockquote&gt;
+&lt;p&gt;&lt;strong&gt;补充&lt;/strong&gt;：因为在拆解的过程中不仅接触到了主逻辑、复杂的边界判断，还有很深的设计哲学。这里主要从前两方面来讲解。&lt;/p&gt;&lt;/blockquote&gt;
+&lt;hr&gt;
+&lt;h2 id="一_sdsnewlen--创建新-sds-字符串"&gt;一、&lt;code&gt;_sdsnewlen&lt;/code&gt; — 创建新 SDS 字符串&lt;/h2&gt;
+&lt;h3 id="函数签名与注释"&gt;函数签名与注释&lt;/h3&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt; 1
+&lt;/span&gt;&lt;span class="lnt"&gt; 2
+&lt;/span&gt;&lt;span class="lnt"&gt; 3
+&lt;/span&gt;&lt;span class="lnt"&gt; 4
+&lt;/span&gt;&lt;span class="lnt"&gt; 5
+&lt;/span&gt;&lt;span class="lnt"&gt; 6
+&lt;/span&gt;&lt;span class="lnt"&gt; 7
+&lt;/span&gt;&lt;span class="lnt"&gt; 8
+&lt;/span&gt;&lt;span class="lnt"&gt; 9
+&lt;/span&gt;&lt;span class="lnt"&gt;10
+&lt;/span&gt;&lt;span class="lnt"&gt;11
+&lt;/span&gt;&lt;span class="lnt"&gt;12
+&lt;/span&gt;&lt;span class="lnt"&gt;13
+&lt;/span&gt;&lt;span class="lnt"&gt;14
+&lt;/span&gt;&lt;span class="lnt"&gt;15
+&lt;/span&gt;&lt;span class="lnt"&gt;16
+&lt;/span&gt;&lt;span class="lnt"&gt;17
+&lt;/span&gt;&lt;span class="lnt"&gt;18
+&lt;/span&gt;&lt;span class="lnt"&gt;19
+&lt;/span&gt;&lt;span class="lnt"&gt;20
+&lt;/span&gt;&lt;span class="lnt"&gt;21
+&lt;/span&gt;&lt;span class="lnt"&gt;22
+&lt;/span&gt;&lt;span class="lnt"&gt;23
+&lt;/span&gt;&lt;span class="lnt"&gt;24
+&lt;/span&gt;&lt;span class="lnt"&gt;25
+&lt;/span&gt;&lt;span class="lnt"&gt;26
+&lt;/span&gt;&lt;span class="lnt"&gt;27
+&lt;/span&gt;&lt;span class="lnt"&gt;28
+&lt;/span&gt;&lt;span class="lnt"&gt;29
+&lt;/span&gt;&lt;span class="lnt"&gt;30
+&lt;/span&gt;&lt;span class="lnt"&gt;31
+&lt;/span&gt;&lt;span class="lnt"&gt;32
+&lt;/span&gt;&lt;span class="lnt"&gt;33
+&lt;/span&gt;&lt;span class="lnt"&gt;34
+&lt;/span&gt;&lt;span class="lnt"&gt;35
+&lt;/span&gt;&lt;span class="lnt"&gt;36
+&lt;/span&gt;&lt;span class="lnt"&gt;37
+&lt;/span&gt;&lt;span class="lnt"&gt;38
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt;/* 根据 &amp;#39;init&amp;#39; 指针和 &amp;#39;initlen&amp;#39; 指定的内容创建一个新的 sds 字符串。
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * 如果 &amp;#39;init&amp;#39; 为 NULL，则字符串用零字节初始化。
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * 如果使用 SDS_NOINIT，则缓冲区保持未初始化状态；
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; *
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * 字符串始终以 null 结尾（所有 sds 字符串都是如此），因此
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * 即使你这样创建一个 sds 字符串：
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; *
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * mystring = sdsnewlen(&amp;#34;abc&amp;#34;,3);
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; *
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * 你也可以用 printf() 打印该字符串，因为字符串末尾隐式包含 \0。
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * 然而该字符串是二进制安全的，中间可以包含 \0 字符，
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * 因为长度存储在 sds 头部中。 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="n"&gt;sds&lt;/span&gt; &lt;span class="nf"&gt;_sdsnewlen&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;init&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;initlen&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;trymalloc&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="n"&gt;sh&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;char&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nf"&gt;sdsReqType&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;initlen&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* 空字符串通常是为了后续追加而创建的。使用 type 8，
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="cm"&gt; * 因为 type 5 不适合此场景。 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;type&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="n"&gt;SDS_TYPE_5&lt;/span&gt; &lt;span class="o"&gt;&amp;amp;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;initlen&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;SDS_TYPE_8&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;hdrlen&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nf"&gt;sdsHdrSize&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;type&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;bufsize&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;trymalloc&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="cm"&gt;/* 防止 size_t 溢出 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;initlen&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;hdrlen&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;=&lt;/span&gt; &lt;span class="n"&gt;initlen&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="nb"&gt;NULL&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;else&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;assert&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;initlen&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;hdrlen&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;initlen&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt; &lt;span class="cm"&gt;/* 捕获 size_t 溢出 */&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="n"&gt;sh&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;trymalloc&lt;/span&gt;&lt;span class="o"&gt;?&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;s_trymalloc_usable&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;hdrlen&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="n"&gt;initlen&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;bufsize&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="o"&gt;:&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;s_malloc_usable&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;hdrlen&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="n"&gt;initlen&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;bufsize&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sh&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="nb"&gt;NULL&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="nb"&gt;NULL&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="nf"&gt;adjustTypeIfNeeded&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;type&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;hdrlen&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;bufsize&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt; &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="nf"&gt;sdsnewplacement&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;sh&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;bufsize&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;type&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;init&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;initlen&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;h3 id="核心要点"&gt;核心要点&lt;/h3&gt;
+&lt;h4 id="1-缓冲区三种初始化方式"&gt;1. 缓冲区三种初始化方式&lt;/h4&gt;
+&lt;p&gt;&lt;code&gt;new&lt;/code&gt; 后的缓冲区有三种处理方式：&lt;/p&gt;</description></item><item><title>Redis源码解析——一份通用的动态字符串设计方案（上）</title><link>https://linzizhuo.github.io/posts/redis-sds-design-part1/</link><pubDate>Wed, 15 Jul 2026 00:00:00 +0000</pubDate><guid>https://linzizhuo.github.io/posts/redis-sds-design-part1/</guid><description>&lt;p&gt;这篇文章讲述 Redis 中动态字符串的设计，同样也是一份通用字符串模块的设计思路。你可以按照自己的需求将其应用到自己的项目中。&lt;/p&gt;
+&lt;h2 id="1-渐进式设计从-char-到-sds"&gt;1. 渐进式设计：从 char* 到 SDS&lt;/h2&gt;
+&lt;p&gt;在探讨 SDS 之前，先做一些职责分析——&lt;/p&gt;
+&lt;p&gt;一个字符串是什么样的？&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;一个二进制安全的字符串是什么样的？&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;len&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;一个支持扩容的字符串是什么样的？&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;len&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;alloc&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;一个根据容量划分变量以达到最优性能的字符串呢？&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;len&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;alloc&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;uint8_t&lt;/span&gt; &lt;span class="n"&gt;flags&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;p&gt;一个柔性数组优化后的字符串是什么样的？&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;div class="chroma"&gt;
+&lt;table class="lntable"&gt;&lt;tr&gt;&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code&gt;&lt;span class="lnt"&gt;1
+&lt;/span&gt;&lt;span class="lnt"&gt;2
+&lt;/span&gt;&lt;span class="lnt"&gt;3
+&lt;/span&gt;&lt;span class="lnt"&gt;4
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;
+&lt;td class="lntd"&gt;
+&lt;pre tabindex="0" class="chroma"&gt;&lt;code class="language-c" data-lang="c"&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;len&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;alloc&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;uint8_t&lt;/span&gt; &lt;span class="n"&gt;flags&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/span&gt;&lt;/span&gt;&lt;span class="line"&gt;&lt;span class="cl"&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="p"&gt;[];&lt;/span&gt; &lt;span class="c1"&gt;// 柔性数组
+&lt;/span&gt;&lt;/span&gt;&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;
+&lt;/div&gt;
+&lt;/div&gt;&lt;blockquote&gt;
+&lt;p&gt;&lt;strong&gt;补充：关于柔性数组&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;柔性数组并不是一个指针，它只是 C99 的一种语法，本质是 &lt;code&gt;&amp;amp;header + sizeof(header)&lt;/code&gt;，不占用结构体空间。使用方法是 &lt;code&gt;malloc(sizeof head + N)&lt;/code&gt;，容量是 N。后面在考虑的时候就可以把柔性数组撇掉了。&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;好处：节省一次 malloc&lt;/li&gt;
+&lt;li&gt;坏处：和 head 是连续内存，扩容不方便&lt;/li&gt;
+&lt;/ul&gt;&lt;/blockquote&gt;
+&lt;h2 id="2-优化思路捡起被浪费的字节"&gt;2. 优化思路：捡起被浪费的字节&lt;/h2&gt;
+&lt;p&gt;怎么对字符串进行优化？其实很简单——&lt;/p&gt;</description></item><item><title>不丢分，比多拿分更值钱——蓝桥杯国一备赛心得</title><link>https://linzizhuo.github.io/posts/lanqiao-cup-preparation/</link><pubDate>Wed, 15 Jul 2026 00:00:00 +0000</pubDate><guid>https://linzizhuo.github.io/posts/lanqiao-cup-preparation/</guid><description>&lt;p&gt;眨眼就到了七月份，蓝桥杯国赛打完也有一个月了。一直想写一份备赛总结，今天就借着水实践课的时间写出来了（小声bb）。&lt;/p&gt;
+&lt;p&gt;首先说一下本文定位：不讲高深的算法和思维（实际上蓝桥杯大部分组别也不需要这些），单纯只是一次经验分享。&lt;/p&gt;
+&lt;h2 id="题目分布与分数线"&gt;题目分布与分数线&lt;/h2&gt;
+&lt;p&gt;先看一下题目分值的分布，以及主播了解的各奖项大概分数线。&lt;/p&gt;
+&lt;h3 id="题目分值"&gt;题目分值&lt;/h3&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;A&lt;/th&gt;
+&lt;th&gt;B&lt;/th&gt;
+&lt;th&gt;C&lt;/th&gt;
+&lt;th&gt;D&lt;/th&gt;
+&lt;th&gt;E&lt;/th&gt;
+&lt;th&gt;F&lt;/th&gt;
+&lt;th&gt;G&lt;/th&gt;
+&lt;th&gt;H&lt;/th&gt;
+&lt;th&gt;I&lt;/th&gt;
+&lt;th&gt;J&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;5&lt;/td&gt;
+&lt;td&gt;5&lt;/td&gt;
+&lt;td&gt;10&lt;/td&gt;
+&lt;td&gt;10&lt;/td&gt;
+&lt;td&gt;15&lt;/td&gt;
+&lt;td&gt;15&lt;/td&gt;
+&lt;td&gt;20&lt;/td&gt;
+&lt;td&gt;20&lt;/td&gt;
+&lt;td&gt;25&lt;/td&gt;
+&lt;td&gt;25&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h3 id="分数线参考以-b-组为例"&gt;分数线参考（以 B 组为例）&lt;/h3&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;奖项&lt;/th&gt;
+&lt;th&gt;大致分数线&lt;/th&gt;
+&lt;th&gt;对应题量&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;国三&lt;/td&gt;
+&lt;td&gt;~30+&lt;/td&gt;
+&lt;td&gt;前 4 题 AC&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;国二&lt;/td&gt;
+&lt;td&gt;~60+&lt;/td&gt;
+&lt;td&gt;前 6 题 AC&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;国一&lt;/td&gt;
+&lt;td&gt;~75+&lt;/td&gt;
+&lt;td&gt;前 7 题 AC 基本稳&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;E 题和 G 题一般是分水岭。当然 OI 赛制下分数线每年浮动，这里只是大概参考。今年来看，前七题 AC 国一基本稳了。&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;声明：以上分数线仅供参考。主播贴上这张表的初衷，是帮大家建立一个笼统的&amp;quot;分数坐标系&amp;quot;——
+有了这个坐标系，赛场上你能更清楚地判断：回头检查和继续开下一题，哪个对奖项提升的收益更大。&lt;/p&gt;
+&lt;p&gt;另一个原因是：蓝桥杯从未公布过官方分数数据，网上流传的分数线也是五花八门。所有的分数信息其实都来自民间（比如洛谷自测）。所以这张表只是主播根据各题难度划分做出的笼统分析，并不严格。但至少在今年的 B 组，基本可以确认：60+ 是国二顶，70 是国一末。&lt;/p&gt;&lt;/blockquote&gt;
+&lt;h2 id="做题策略"&gt;做题策略&lt;/h2&gt;
+&lt;p&gt;平时刷题我们只有三种状态：不会 / AC / WA（抓耳挠腮态）。&lt;/p&gt;</description></item><item><title>从竞赛到系统编程：我为什么在三个国奖后转型</title><link>https://linzizhuo.github.io/posts/from-competitive-programming-to-systems/</link><pubDate>Wed, 15 Jul 2026 00:00:00 +0000</pubDate><guid>https://linzizhuo.github.io/posts/from-competitive-programming-to-systems/</guid><description>&lt;h2 id="三个国奖之后"&gt;三个国奖之后&lt;/h2&gt;
+&lt;p&gt;蓝桥杯国一、天梯赛个人国二、睿抗国一——打到第三个的时候，我开始意识到一个问题：&lt;strong&gt;再做一道 DP、再刷一个数据结构，能带来的提升越来越小了。&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;竞赛的边际收益在递减。这不是&amp;quot;刷够 500 题就能质变&amp;quot;的阶段了——那个阶段早在一年前就过去了。现在是技术天花板的问题：我不太可能靠继续刷题冲进 ICPC 区域赛金牌。&lt;/p&gt;
+&lt;p&gt;那与其在同一个维度上内卷，不如切换到另一个维度。&lt;/p&gt;
+&lt;h2 id="为什么是底层"&gt;为什么是底层&lt;/h2&gt;
+&lt;p&gt;竞赛训练了我的算法直觉——复杂的区间合并、懒标记下传、状态机 DP——这些都能在几十分钟内拆解清楚。但有个问题一直让我不舒服：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;我不知道 &lt;code&gt;std::vector&lt;/code&gt; 怎么分配内存的。&lt;/strong&gt; 不知道 &lt;code&gt;sort&lt;/code&gt; 的快排和堆排怎么切换的。不知道程序从 &lt;code&gt;main&lt;/code&gt; 到 &lt;code&gt;cout&lt;/code&gt; 中间经历了什么。&lt;/p&gt;
+&lt;p&gt;我写的所有代码，都运行在一个我从未认真审视过的&amp;quot;黑盒&amp;quot;之上。&lt;/p&gt;
+&lt;p&gt;这不只是好奇心——它是能力边界。不理解底层，我就永远写不出高性能的系统，没法 debug 一个内存泄漏到崩溃的程序，也看不懂那些真正决定软件质量的代码。&lt;/p&gt;
+&lt;h2 id="路线"&gt;路线&lt;/h2&gt;
+&lt;p&gt;按 CS 经典路线走，项目驱动 + 博客记录：&lt;/p&gt;
+&lt;pre tabindex="0"&gt;&lt;code&gt;CS:APP → OSTEP → 选方向深耕（OS / 网络 / 编译）
+&lt;/code&gt;&lt;/pre&gt;&lt;h2 id="关于这个博客"&gt;关于这个博客&lt;/h2&gt;
+&lt;p&gt;接下来的文章会是边做边记的学习笔记——读一章原理，写一段代码，记录遇到的问题和思考。&lt;/p&gt;
+&lt;p&gt;不是写给谁看的教程，只是&amp;quot;我理解了什么&amp;quot;的记录。但如果你也在从竞赛转向系统编程，希望这些笔记能帮到你。&lt;/p&gt;</description></item><item><title>关于</title><link>https://linzizhuo.github.io/about/</link><pubDate>Wed, 15 Jul 2026 00:00:00 +0000</pubDate><guid>https://linzizhuo.github.io/about/</guid><description>&lt;h2 id="我是谁"&gt;我是谁&lt;/h2&gt;
+&lt;p&gt;一名从算法竞赛转向系统编程的学生。&lt;/p&gt;
+&lt;h3 id="竞赛经历"&gt;竞赛经历&lt;/h3&gt;
+&lt;ul&gt;
+&lt;li&gt;🥇 蓝桥杯国一&lt;/li&gt;
+&lt;li&gt;🥇 天梯赛个人国二&lt;/li&gt;
+&lt;li&gt;🥇 睿抗国一&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;三项国奖后意识到边际收益递减，决定深耕底层。&lt;/p&gt;
+&lt;h3 id="这个博客"&gt;这个博客&lt;/h3&gt;
+&lt;p&gt;记录从竞赛思维到系统思维的转型过程——边写项目，边沉淀原理。&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;系统编程&lt;/strong&gt;：CS:APP 学习笔记、malloc lab、OS 实验&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;算法存档&lt;/strong&gt;：过去的题解，偶尔更新&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3 id="联系"&gt;联系&lt;/h3&gt;
+&lt;ul&gt;
+&lt;li&gt;GitHub: &lt;a href="https://github.com/linzizhuo"&gt;@linzizhuo&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;</description></item></channel></rss>

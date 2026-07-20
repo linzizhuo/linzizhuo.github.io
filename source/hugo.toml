@@ -1,4 +1,5 @@
 baseURL = 'https://linzizhuo.github.io/'
+publishDir = '..'
 defaultContentLanguage = 'zh-cn'
 title = '从竞赛到系统 — 底层学习笔记'
 theme = 'PaperMod'
